@@ -1,0 +1,207 @@
+# ============================================================================
+# config.yaml
+# ----------------------------------------------------------------------------
+# Central configuration for the analysis pipeline.
+#
+# All parameters live here rather than in the source, so a run is fully
+# described by this one file. Keep a copy alongside any results you want to
+# reproduce later.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Data
+# ----------------------------------------------------------------------------
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  # The five index universes. `name` is the base filename (without extension);
+  # the loader resolves either `<name>.json` or `<name>.json.bz2` automatically.
+  # `label` is used in figures and tables; `market` is the region.
+  indices:
+    - {name: "RUSSELL1000", label: "Russell 1000", market: "US"}
+    - {name: "STOXX600",    label: "STOXX 600",    market: "Europe"}
+    - {name: "STOXX1800",   label: "STOXX 1800",   market: "Global-Dev"}
+    - {name: "SHANGHAI_A",  label: "Shanghai-A",   market: "China"}
+    - {name: "TOPIX1000",   label: "TOPIX 1000",   market: "Japan"}
+
+# ----------------------------------------------------------------------------
+# Preprocessing
+# ----------------------------------------------------------------------------
+preprocessing:
+  start_date: "2009-01-01"
+  end_date:   "2023-02-28"
+  calendar_alignment: "intersection"   # {"intersection", "union"}
+                                  # "intersection" keeps only dates on which
+                                  # every market traded. A union calendar would
+                                  # require filling non-trading days, which
+                                  # injects zero returns and biases volatility
+                                  # and correlation downward.
+  max_forward_fill_days: 0        # 0 = never carry a return forward
+  min_constituent_history: 252    # min trading days a constituent must have
+  winsorize_quantiles: [0.001, 0.999]  # per-constituent tail clipping
+  min_active_constituents: 50     # drop days where a market has implausibly few
+                                  # active names (residual data artefacts)
+
+# ----------------------------------------------------------------------------
+# Exploratory data analysis
+# ----------------------------------------------------------------------------
+eda:
+  ljung_box_lags: 10              # lag order for Ljung-Box Q tests
+  arch_lm_lags: 10                # lag order for ARCH-LM test
+  # Regression-based tests (ADF, KPSS, Ljung-Box, ARCH-LM) run per constituent
+  # and are expensive across thousands of names, so they use a seeded random
+  # sample of up to this many qualifying constituents per market. Moment-based
+  # statistics (mean, sd, skew, kurtosis, Jarque-Bera) always use every name.
+  max_constituents_for_tests: 250
+  rolling_corr_window: 63         # trading days (~3 months)
+  crisis_periods:                 # labelled sub-periods for the breakdown
+    - {name: "Euro debt crisis", start: "2011-07-01", end: "2012-07-31"}
+    - {name: "COVID-19 crash",   start: "2020-02-19", end: "2020-04-30"}
+
+# ----------------------------------------------------------------------------
+# Regime detection
+# ----------------------------------------------------------------------------
+regimes:
+  model: "hmm"                    # {"hmm"} Gaussian hidden Markov model
+  n_states_grid: [2, 3]           # candidate number of latent states (K)
+  covariance_type: "full"         # hmmlearn Gaussian HMM covariance
+  n_iter: 1000                    # EM (Baum-Welch) max iterations
+  n_init: 10                      # random restarts; best log-likelihood kept.
+                                  # EM converges only locally, so a single fit
+                                  # is unreliable.
+  random_state: 42
+  model_selection: "bic"          # {"bic", "aic"}
+  features: ["return", "realised_vol"]  # emission features when using the index
+  vol_window: 21                  # rolling window (days) for realised_vol
+
+  # Feature set driving the regimes used for allocation.
+  feature_source: "constituent"   # {"constituent", "index"}
+  constituent_features: ["xs_dispersion", "frac_negative", "xs_skew",
+                         "avg_pairwise_corr", "eig1_share"]
+  constituent_window: 63          # trailing window for the correlation-structure
+                                  # features (avg_pairwise_corr, eig1_share)
+  max_names_for_eig: 200          # cross-section cap for the eigenvalue feature;
+                                  # the full SVD is too slow otherwise
+  inference: "filtered"           # {"filtered", "smoothed"}
+                                  # Allocation must use the filtered
+                                  # P(s_t | x_1..x_t). Smoothed output conditions
+                                  # on the whole sample and is for plots only.
+
+# ----------------------------------------------------------------------------
+# MS-GARCH (optional)
+# ----------------------------------------------------------------------------
+# Fitted in R via the MSGARCH package through rpy2. Provides a volatility-focused
+# comparison against the HMM above; conditions no portfolio and can be skipped.
+msgarch:
+  n_states: 2                     # number of Markov-switching regimes
+  garch_model: "sGARCH"           # per-state variance model (MSGARCH spec)
+  distribution: "std"             # innovations: "std" (Student-t) or "norm"
+  return_scale: 100.0             # percentage scaling, for optimiser stability
+
+# ----------------------------------------------------------------------------
+# Portfolio construction
+# ----------------------------------------------------------------------------
+portfolio:
+  # Five construction methods crossed with two conditioning states ("_rc" =
+  # regime-conditional), plus the 1/N and passive index benchmarks. Both members
+  # of each pair run through an identical loop, universe and cost model, so the
+  # difference between them isolates the effect of regime conditioning.
+  strategies: ["equal_weight", "index_benchmark",
+               "mean_variance", "mean_variance_rc",
+               "min_variance",  "min_variance_rc",
+               "hrp",           "hrp_rc",
+               "cvar",          "cvar_rc",
+               "equilibrium",   "equilibrium_rc"]
+  regime_weight_floor: 0.0              # min observation weight under regime
+                                        # conditioning (0 = pure posterior weight)
+  long_only: true
+  covariance_estimator: "ledoit_wolf"   # {"sample", "ledoit_wolf"}
+                                        # The sample estimator is singular here:
+                                        # assets outnumber observations.
+  cvar_confidence: 0.95
+  lookback_days_grid: [63, 126, 252]    # windows used by the sensitivity sweep
+  default_lookback: 252                 # window used unless a sweep overrides it
+  max_universe: 300                     # cap on investable names per rebalance
+                                        # (null = all eligible). Keeps repeated
+                                        # optimisation tractable; selection keeps
+                                        # the fullest-history names.
+  min_window_coverage: 1.0              # fraction of the estimation window an
+                                        # asset must be present to be investable.
+                                        # 1.0 = complete windows only, so no
+                                        # return is ever imputed. Lower this only
+                                        # if a market's universe becomes too
+                                        # small to optimise over.
+  mean_variance_objective: "max_sharpe" # {"max_sharpe", "max_utility"}
+  risk_aversion: 1.0                    # used by the max_utility objective
+  regime_model: "hmm"                   # regime source for "_rc" strategies:
+                                        # "hmm"     -> <INDEX>_regimes.csv
+                                        # "msgarch" -> <INDEX>_msgarch_regimes.csv
+  bl_tau: 0.05                          # prior uncertainty scale
+  bl_view_confidence: 1.0               # confidence in regime-derived views;
+                                        # higher values pull the posterior
+                                        # further from the equilibrium prior
+  bl_min_regime_days: 20                # min in-window days needed for a
+                                        # regime-specific mean, else fall back
+                                        # to the overall window mean
+
+# ----------------------------------------------------------------------------
+# Backtesting
+# ----------------------------------------------------------------------------
+backtest:
+  train_end: "2011-12-31"         # warm-up period ends here; measured
+                                  # performance starts the following day
+  rebalance_frequency: "M"        # {"W", "M", "Q"} pandas offset alias
+  transaction_cost_bps: 10.0      # charged per unit of one-way turnover
+  risk_free_annual: 0.0           # constant rate; replace with a T-bill series
+                                  # if one is available
+  trading_days_per_year: 252
+  regime_refit_frequency: "annual"  # {"annual", "each"} how often the HMM is
+                                    # refitted during the walk-forward loop.
+                                    # Parameters always use past data only; the
+                                    # state probability is filtered at every
+                                    # rebalance regardless.
+  regime_refit_n_init: 5          # EM restarts during walk-forward refits;
+                                  # lower than `regimes.n_init` for speed, since
+                                  # this runs at every refit
+
+# ----------------------------------------------------------------------------
+# Statistical inference
+# ----------------------------------------------------------------------------
+inference:
+  benchmark: "equal_weight"       # strategy each candidate is tested against
+  block_size: 21                  # circular block length (~1 trading month);
+                                  # preserves serial dependence in the resample
+  n_bootstrap: 2000               # bootstrap resamples per test
+  fdr_alpha: 0.05                 # Benjamini-Hochberg false-discovery rate
+  # The Deflated Sharpe Ratio needs a trial count, which defaults to
+  # strategies x markets. Raise it to include hyper-parameter configurations.
+
+# ----------------------------------------------------------------------------
+# Sensitivity analysis
+# ----------------------------------------------------------------------------
+sensitivity:
+  # Equilibrium-method view aggressiveness.
+  bl_view_confidence_grid: [0.1, 0.25, 0.5, 1.0, 2.0]
+  bl_tau_grid: [0.05]
+  # Sweeps affecting all strategies.
+  lookback_grid: [63, 126, 252]
+  transaction_cost_grid_bps: [5.0, 10.0, 20.0]
+  rebalance_frequency_grid: ["M", "Q"]
+  # Markets included in the sweeps (null = all). Each sweep re-runs the whole
+  # backtest per grid point, so restricting this materially affects runtime.
+  sweep_markets: ["RUSSELL1000", "SHANGHAI_A"]
+
+# ----------------------------------------------------------------------------
+# Figures
+# ----------------------------------------------------------------------------
+figures:
+  # Market shown in full detail in the per-market figures. The others appear
+  # only in the cross-market comparison.
+  primary_market: "RUSSELL1000"
+
+# ----------------------------------------------------------------------------
+# Reproducibility and output paths
+# ----------------------------------------------------------------------------
+seed: 42
+figures_dir: "results/figures"
+tables_dir: "results/tables"
